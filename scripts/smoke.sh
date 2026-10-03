@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→修订/变更查询 全流程。
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→修订/变更查询→班次归因快照 全流程。
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -111,6 +111,22 @@ echo "-- 非法游标 / 超限页大小，预期 422 --"
 req GET "/changes?cursor=-1"
 req GET "/changes?cursor=999999"
 req GET "/changes?limit=1000"
+
+echo "-- 班次归因快照：不指定 seq，取当前已提交最大序号（每页 2 条，按班次 id 翻页）--"
+req GET "/snapshots/shifts?device_id=CNC-01&start=2026-10-01T00:00:00%2B08:00&end=2026-10-02T00:00:00%2B08:00&limit=2"
+
+echo "-- 指定历史序号 seq=1：只含截至序号 1 已结算的班次最后修订（早班 rev1）--"
+req GET "/snapshots/shifts?device_id=CNC-01&start=2026-10-01T00:00:00%2B08:00&end=2026-10-02T00:00:00%2B08:00&seq=1"
+
+echo "-- 空快照（seq=0）：空页、next_cursor=null --"
+req GET "/snapshots/shifts?device_id=CNC-01&start=2026-10-01T00:00:00%2B08:00&end=2026-10-02T00:00:00%2B08:00&seq=0"
+
+echo "-- 快照序号越界 / 未知设备 / 缺时区 / 页大小越界，预期 422 / 404 --"
+req GET "/snapshots/shifts?device_id=CNC-01&start=2026-10-01T00:00:00%2B08:00&end=2026-10-02T00:00:00%2B08:00&seq=999999"
+req GET "/snapshots/shifts?device_id=NOPE&start=2026-10-01T00:00:00%2B08:00&end=2026-10-02T00:00:00%2B08:00"
+req GET "/snapshots/shifts?device_id=CNC-01&start=2026-10-01T00:00:00&end=2026-10-02T00:00:00%2B08:00"
+req GET "/snapshots/shifts?device_id=CNC-01&start=2026-10-01T00:00:00%2B08:00&end=2026-10-02T00:00:00%2B08:00&limit=0"
+req GET "/snapshots/shifts?device_id=CNC-01&start=2026-10-01T00:00:00%2B08:00&end=2026-10-02T00:00:00%2B08:00&cursor=garbage"
 
 echo "-- 非法区间 / 未知设备，预期 422 / 404 --"
 req POST /shifts '{"device_id":"CNC-01","start":"2026-10-02T16:00:00+08:00","end":"2026-10-02T08:00:00+08:00"}'

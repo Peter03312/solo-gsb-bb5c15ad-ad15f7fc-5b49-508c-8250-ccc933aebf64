@@ -24,6 +24,15 @@ def _check_ts(v: datetime) -> datetime:
     return v
 
 
+def parse_aware_minute_window(start: datetime, end: datetime) -> tuple[datetime, datetime]:
+    """校验查询窗口：必须带时区、精确到整分钟，且 start < end；否则 ValueError。"""
+    start = _check_ts(start)
+    end = _check_ts(end)
+    if not start < end:
+        raise ValueError("invalid window: start must be earlier than end")
+    return start, end
+
+
 class _Interval(BaseModel):
     start: datetime
     end: datetime
@@ -168,6 +177,33 @@ class ChangePage(BaseModel):
 
     changes: list[ChangeEntry]
     next_cursor: int
+
+
+# ---------------------------------------------------------------- 班次归因快照
+
+
+class SnapshotShiftEntry(BaseModel):
+    """快照中一个班次在快照序号下的最后修订（内容不可变）。"""
+
+    shift_id: int
+    device_id: str
+    shift_start: datetime
+    shift_end: datetime
+    revision: int  # 序号不大于 snapshot_seq 的最后修订号
+    seq: int  # 该修订对应的全局变更序号（<= snapshot_seq）
+    totals: ReasonMinutes
+
+
+class ShiftSnapshotPage(BaseModel):
+    """班次归因快照的一页。
+
+    同一快照（相同 snapshot_seq + 筛选条件）可稳定翻页：后续更正/裁定/新结算
+    不影响后续页；末页（含空快照）next_cursor 为 null。
+    """
+
+    snapshot_seq: int  # 本快照绑定的全局变更序号（未指定 seq 时取首次请求时已提交的最大序号）
+    shifts: list[SnapshotShiftEntry]
+    next_cursor: str | None = None  # 续页游标（不透明）；无下一页时为 null
 
 
 # ---------------------------------------------------------------- 现场人工裁定

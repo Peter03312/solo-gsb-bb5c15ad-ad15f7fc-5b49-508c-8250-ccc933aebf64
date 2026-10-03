@@ -6,7 +6,9 @@
 **整批补传**同一设备的事件列表（全或无：逐项核对版本链，任一非法整批失败，成功时按最终状态
 一次性重算受影响班次）；已结算班次还可登记**现场人工裁定**（唯一单号、整分钟区间、原因/说明，
 可按单号撤销），裁定按生效顺序覆盖自动事件归因、撤销后回退；所有结果变化通过**全局递增游标**
-的变更流（`GET /changes`）供下游报表持续同步每次结算、更正、裁定与撤销。
+的变更流（`GET /changes`）供下游报表持续同步每次结算、更正、裁定与撤销；下游报表**首次接入或
+重建索引**时，可用 `GET /snapshots/shifts` 按**固定变更序号**取得班次归因快照（半开窗窗口相交、
+截至该序号已结算的班次最后修订），按班次标识稳定翻页，快照序号直接衔接变更流增量同步。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Docker Compose
 
@@ -89,6 +91,20 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
   `adjudication_revoke`），`GET /changes?cursor=&limit=` 按游标分页读取；修订与变更记录
   同一行存储、同事务提交/回滚，序号顺序即提交顺序，已返回条目不可变；空页保持原游标，
   非法游标/超限页大小返回 `422`。
+- **首次接入/重建索引快照**：`GET /snapshots/shifts` 按**固定变更序号**读取班次归因快照，
+  用于下游报表全量初始化，随后直接续接变更流增量同步。
+  - 调用方指定 `device_id`、带时区且整分钟对齐的**半开窗口** `start`/`end` 与页大小 `limit`
+    （缺省 100，上限 500），可指定 `seq`；**未指定 `seq` 时以首次请求读取时已提交的最大
+    变更序号为准**，每页回传该 `snapshot_seq` 与不透明续页游标 `next_cursor`；
+  - 只列出与窗口相交（端点相接不算）、**截至该序号已结算**的班次；每班次取序号不大于
+    快照序号的**最后修订**，返回班次标识、区间、修订号（及该修订的变更序号）与三类原因
+    分钟数，**按班次标识（id）升序稳定翻页**；
+  - 修订只追加不修改，**同一快照的后续页不受后续更正、裁定、撤销或新结算影响**；
+    末页（含空快照、`seq=0`、系统尚无变更）返回空列表、`next_cursor=null`；
+  - 续页请求仍须携带 `device_id`/`start`/`end`/`limit` 与上一页游标（`seq` 可回传，
+    给定时须与游标一致）；游标与筛选条件或序号不匹配 / 非法格式 → `422 INVALID_SNAPSHOT_CURSOR`；
+  - `seq` 超过当前已提交最大序号 → `422 SNAPSHOT_SEQ_OUT_OF_RANGE`；未知设备 `404 DEVICE_NOT_FOUND`；
+    缺时区 / 未对齐整分钟 / `start >= end` / 页大小越界 → `422 VALIDATION_ERROR`。
 - **错误**：未知设备 `404 DEVICE_NOT_FOUND`，非法区间 `422`，未结算 `404 RESULT_NOT_FOUND`，
   未知班次/修订 `404`。错误体统一为 `{"detail": {"code": "...", "message": "..."}}`。
 
@@ -109,6 +125,7 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | `POST` | `/shifts/{id}/adjudications/{rulingNo}/revoke` | 按单号撤销裁定（首次 201 / 重复撤销 200 / 未知单号 404） |
 | `GET` | `/shifts/{id}/adjudications` | 班次的全部裁定（含已撤销，按生效顺序） |
 | `GET` | `/changes?cursor=&limit=` | 变更同步：按全局递增游标分页读取结算/更正/裁定/撤销变更 |
+| `GET` | `/snapshots/shifts?device_id=&start=&end=&seq=&cursor=&limit=` | 首次接入/重建索引：按固定变更序号读取班次归因快照，按班次标识稳定翻页 |
 | `GET` | `/health` | 健康检查 |
 
 原因枚举：`maintenance`（保养）、`failure`（故障）、`pending`（待判）。
@@ -130,6 +147,8 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | 422 | `RULING_OUT_OF_RANGE` | 裁定区间越出班次窗口 |
 | 422 | `VALIDATION_ERROR` | 非法参数：区间无效、缺时区、未对齐整分钟、原因非法、游标/页大小越界等 |
 | 422 | `INVALID_CURSOR` | 同步游标超过当前最大变更序号（客户端进度异常，需从较小游标重新同步） |
+| 422 | `SNAPSHOT_SEQ_OUT_OF_RANGE` | 快照序号超过当前已提交最大变更序号（省略 seq 即取当前最大） |
+| 422 | `INVALID_SNAPSHOT_CURSOR` | 快照续页游标非法/被篡改，或与设备、时间窗口、快照序号不匹配（从第一页重新取快照） |
 
 ## 调用示例
 
@@ -465,6 +484,101 @@ curl 'http://localhost:8000/changes?limit=1000'    # VALIDATION_ERROR（上限 5
 curl 'http://localhost:8000/changes?cursor=999'    # INVALID_CURSOR（超过当前最大序号）
 ```
 
+## 班次归因快照（首次接入 / 重建索引）
+
+下游报表**首次接入**（或索引损坏后**重建**）时，需要一份按固定变更序号冻结的全量基线：
+`GET /snapshots/shifts` 返回与指定半开窗口相交、截至该序号已结算的班次在该序号下的**最后修订**
+（班次标识、区间、修订号、三类原因分钟数），**按班次标识（id）升序稳定翻页**；拿到快照后用
+回传的 `snapshot_seq` 作为 `GET /changes` 的起始游标，即可无缝续接增量同步。
+
+**参数**（均为 query）
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `device_id` | 是 | 设备标识；未知设备 `404 DEVICE_NOT_FOUND` |
+| `start` / `end` | 是 | 半开查询窗口，必须带时区、精确到整分钟、`start < end`（URL 中 `+` 需编码为 `%2B`） |
+| `limit` | 否 | 页大小，缺省 100，范围 1–500 |
+| `seq` | 否 | 快照变更序号；**省略时以首次请求读取时已提交的最大序号为准**；超过当前最大序号 `422 SNAPSHOT_SEQ_OUT_OF_RANGE` |
+| `cursor` | 否 | 上一页 `next_cursor`；续页须连同设备、窗口、页大小一并回传，`seq` 给定时须与游标一致 |
+
+**语义保证**
+
+- 每页都回传 `snapshot_seq`：显式给 `seq` 时即该值；省略时为首次请求确定的序号，并被编码进
+  续页游标 —— 后续页不会因新结算/更正/裁定而漂移；
+- 快照直接读取**只追加、不可变**的修订表：每班次取 `seq <= snapshot_seq` 的最后修订；
+  截至快照序号未结算的班次、窗口外（含仅端点相接）的班次、其他设备的班次均不出现；
+- **同一快照翻页结果恒定**：快照建立之后的更正、裁定、撤销或新结算都不改变其后续页；
+  `next_cursor=null` 表示已到末页；空快照（`seq=0`、系统尚无变更或窗口内无已结算班次）
+  返回 `{"snapshot_seq": N, "shifts": [], "next_cursor": null}`；
+- 游标是绑定 `device_id / start / end / snapshot_seq / 已翻到的班次 id` 的不透明令牌
+  （带完整性摘要），与筛选条件或序号不匹配、格式非法或被篡改 →
+  `422 INVALID_SNAPSHOT_CURSOR`，应放弃游标、从第一页重新取快照。
+
+**调用示例**（延续上文主流程：班次 1 已历经结算、更正、裁定/撤销等多次修订）
+
+```bash
+# 1) 首次请求：省略 seq → 以当前已提交最大序号（此例为 5）建立快照
+curl 'http://localhost:8000/snapshots/shifts?device_id=CNC-01&start=2026-09-30T16:00:00%2B00:00&end=2026-10-01T16:00:00%2B00:00&limit=100'
+```
+
+```json
+{
+  "snapshot_seq": 5,
+  "shifts": [{
+    "shift_id": 1,
+    "device_id": "CNC-01",
+    "shift_start": "2026-10-01T00:00:00Z",
+    "shift_end": "2026-10-01T08:00:00Z",
+    "revision": 5,
+    "seq": 5,
+    "totals": {"maintenance": 60, "failure": 30, "pending": 0}
+  }],
+  "next_cursor": null
+}
+```
+
+```bash
+# 2) 大结果集翻页：带上一页 next_cursor（设备/窗口/limit 不变；seq 可回传或省略）
+curl -G 'http://localhost:8000/snapshots/shifts' \
+  --data-urlencode 'device_id=CNC-01' \
+  --data-urlencode 'start=2026-09-01T00:00:00+08:00' \
+  --data-urlencode 'end=2026-11-01T00:00:00+08:00' \
+  --data-urlencode 'seq=5' \
+  --data-urlencode 'limit=100' \
+  --data-urlencode 'cursor=eyJ...（上一页 next_cursor 原样回传）'
+# 建议用 curl -G --data-urlencode，由 curl 负责时区偏移中 + 号的百分号编码
+
+# 3) 指定历史序号重建：seq=1 只含截至序号 1 已结算的班次及其修订 1（晚于序号 1 的更正/裁定均不可见）
+curl 'http://localhost:8000/snapshots/shifts?device_id=CNC-01&start=2026-09-30T16:00:00%2B00:00&end=2026-10-01T16:00:00%2B00:00&seq=1'
+# → {"snapshot_seq": 1,
+#    "shifts": [{"shift_id": 1, "revision": 1, "seq": 1,
+#                "totals": {"maintenance": 60, "failure": 60, "pending": 0}, ...}],
+#    "next_cursor": null}
+
+# 4) 空快照（seq=0，或窗口内尚无已结算班次）
+curl 'http://localhost:8000/snapshots/shifts?device_id=CNC-01&start=2026-09-30T16:00:00%2B00:00&end=2026-10-01T16:00:00%2B00:00&seq=0'
+# → {"snapshot_seq": 0, "shifts": [], "next_cursor": null}
+
+# 5) 快照翻完后，用 snapshot_seq 作为变更流起始游标，续接增量同步
+curl 'http://localhost:8000/changes?cursor=5&limit=100'
+# → 只返回 seq > 5 的后续结算/更正/裁定/撤销，与全量快照恰好衔接、不重不漏
+```
+
+```bash
+# 6) 错误示例
+curl '.../snapshots/shifts?device_id=CNC-01&start=...&end=...&seq=999'      # 422 SNAPSHOT_SEQ_OUT_OF_RANGE
+curl '.../snapshots/shifts?device_id=NOPE&start=...&end=...'                # 404 DEVICE_NOT_FOUND
+curl '.../snapshots/shifts?device_id=CNC-01&start=2026-10-01&end=...'       # 422 VALIDATION_ERROR（缺时区）
+curl '.../snapshots/shifts?device_id=CNC-01&start=...&end=...&limit=0'      # 422 VALIDATION_ERROR
+curl '.../snapshots/shifts?device_id=CNC-01&start=...&end=...&cursor=foo'   # 422 INVALID_SNAPSHOT_CURSOR
+# 游标绑定的设备/窗口/序号与本次请求不一致（如换了窗口仍用旧游标）→ 422 INVALID_SNAPSHOT_CURSOR
+```
+
+> 与变更流的一致性：快照序号与 `GET /changes` 的游标同属一个全局序号空间（修订与变更记录
+> 同一行、同事务提交）。因此「`seq=S` 快照（含每个班次 `<= S` 的最后修订）」＋「`/changes`
+> 从 `cursor=S` 起的增量」构成某个时间点的完整一致视图；快照建立后服务端继续写入也不会
+> 影响快照页内容。
+
 ## 设计要点
 
 - **归因算法**（`app/attribution.py`，纯标准库可独立测试）：按原因收集区间并裁剪到班次窗口；
@@ -497,13 +611,19 @@ curl 'http://localhost:8000/changes?cursor=999'    # INVALID_CURSOR（超过当�
   `UPDATE ... RETURNING` 递增分配，行锁持有至提交，故序号顺序 == 提交顺序，同步游标不会越过
   尚未可见的较早变更；条目不可变，重读一致。既有库启动时自动迁移：为 `shift_results`
   回填 `seq`（按原自增 id 顺序）、加宽 `trigger` 列以容纳裁定触发器，并以最大序号初始化计数器。
+- **归因快照**：快照查询不新建任何状态，仅以 `seq <= snapshot_seq` 过滤不可变修订表，按
+  `(shift_id, max(revision))` 取每班次在该序号下的最后修订，与班次表半开区间相交过滤后，
+  以班次 id 为 keyset 稳定翻页（多取 1 行判断是否还有下一页）；快照序号在首页确定后编入
+  续页游标（base64url JSON + sha256 摘要防篡改），游标同时绑定设备与窗口，故后续更正/裁定/
+  撤销/新结算既不改写历史修订，也不影响同一快照的后续页；快照序号与变更流游标同序号空间，
+  `snapshot_seq` 可直接作为 `/changes?cursor=` 的起点。
 
 ## 项目结构
 
 ```
 app/
   main.py         # FastAPI 路由
-  services.py     # 业务逻辑：版本链、幂等、结算、更正重算
+  services.py     # 业务逻辑：版本链、幂等、结算、更正重算、变更流、快照查询与续页游标
   attribution.py  # 归因算法（半开区间运算，纯标准库）
   models.py       # SQLAlchemy 模型
   schemas.py      # Pydantic 请求/响应与校验
@@ -513,6 +633,7 @@ tests/
   test_attribution.py    # 算法单测（含裁定覆盖/重叠/回退，无外部依赖，可 python3 直接跑）
   test_api.py            # API 端到端测试（需 PostgreSQL）
   test_changes.py        # 变更同步（游标分页/回放/并发）端到端测试（需 PostgreSQL）
+  test_snapshots.py      # 归因快照（固定序号/相交过滤/稳定翻页/游标校验/衔接变更流）端到端测试（需 PostgreSQL）
   test_adjudications.py  # 现场裁定（提交/幂等/冲突/撤销/联动/并发）端到端测试（需 PostgreSQL）
   test_event_batch.py    # 断网补传（整批核对/全或无/重算/并发）端到端测试（需 PostgreSQL）
 scripts/smoke.sh         # 冒烟脚本

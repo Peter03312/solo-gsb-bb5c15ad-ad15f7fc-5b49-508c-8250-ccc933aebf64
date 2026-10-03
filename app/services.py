@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
@@ -803,3 +805,165 @@ def list_changes(
     page = [(rev, shift) for rev, shift in rows]
     next_cursor = page[-1][0].seq if page else cursor
     return page, next_cursor
+
+
+# ---------------------------------------------------------------- 班次归因快照
+
+#: GET /snapshots/shifts 允许的页大小上限
+SNAPSHOT_MAX_PAGE_SIZE = 500
+
+#: 续页游标载荷格式版本
+_CURSOR_VERSION = 1
+
+
+def _encode_snapshot_cursor(payload: dict) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    # 附短摘要防止客户端伪造/篡改游标
+    tag = hashlib.sha256(raw).digest()[:8]
+    return base64.urlsafe_b64encode(raw + b"#" + tag).decode("ascii")
+
+
+def _decode_snapshot_cursor(cursor: str) -> dict:
+    """解码并校验续页游标；结构非法或被篡改一律按 INVALID_SNAPSHOT_CURSOR 拒绝。"""
+    invalid = ApiError(
+        422,
+        "INVALID_SNAPSHOT_CURSOR",
+        "malformed or tampered snapshot cursor; restart the snapshot from page 1",
+    )
+    try:
+        raw_b64 = cursor.encode("ascii")
+        if any(ch not in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=" for ch in raw_b64):
+            raise ValueError
+        blob = base64.urlsafe_b64decode(raw_b64)
+        raw, tag = blob.rsplit(b"#", 1)
+        if hashlib.sha256(raw).digest()[:8] != tag:
+            raise ValueError
+        token = json.loads(raw)
+    except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError):
+        raise invalid
+    required = {"v", "device_id", "start", "end", "seq", "after_shift_id"}
+    if not isinstance(token, dict) or set(token) != required:
+        raise invalid
+    if token["v"] != _CURSOR_VERSION or not isinstance(token["device_id"], str):
+        raise invalid
+    if isinstance(token["seq"], bool) or not isinstance(token["seq"], int) or token["seq"] < 1:
+        raise invalid
+    if (
+        isinstance(token["after_shift_id"], bool)
+        or not isinstance(token["after_shift_id"], int)
+        or token["after_shift_id"] < 0
+    ):
+        raise invalid
+    try:
+        ts_start = datetime.fromisoformat(token["start"])
+        ts_end = datetime.fromisoformat(token["end"])
+    except ValueError:
+        raise invalid
+    if ts_start.tzinfo is None or ts_end.tzinfo is None:
+        raise invalid
+    return token
+
+
+def get_shift_snapshot(
+    db: Session,
+    *,
+    device_id: str,
+    start: datetime,
+    end: datetime,
+    seq: int | None,
+    cursor: str | None,
+    limit: int,
+) -> tuple[int, list[tuple[Shift, ShiftResult]], str | None]:
+    """按固定变更序号读取班次归因快照（首次接入/重建索引），稳定按键翻页。
+
+    返回 (快照序号, [(班次, 该序号下最后修订)], 续页游标)。
+
+    - 只列与半开窗口 [start, end) 相交、截至快照序号已结算（存在 seq <= 快照序号
+      的修订）的班次；每班次取序号不大于快照序号的最后修订；
+    - 序号未指定时，以"首次请求读取时"已提交的最大变更序号为准（每页回传该序号）；
+    - 续页游标绑定设备/窗口/快照序号与已翻过的最后班次 id：与筛选条件或序号不匹配
+      时明确报错；修订只追加不修改，同一快照后续页不受新结算/更正/裁定影响；
+    - 指定序号超过当前已提交最大序号时 422 SNAPSHOT_SEQ_OUT_OF_RANGE；
+    - 空快照（含快照序号 0）返回空页，next_cursor 为 null。
+    """
+    start_u, end_u = _utc(start), _utc(end)
+    start_iso, end_iso = start_u.isoformat(), end_u.isoformat()
+    after_shift_id = 0
+
+    if cursor is not None:
+        token = _decode_snapshot_cursor(cursor)
+        if (
+            token["device_id"] != device_id
+            or token["start"] != start_iso
+            or token["end"] != end_iso
+            or (seq is not None and seq != token["seq"])
+        ):
+            raise ApiError(
+                422,
+                "INVALID_SNAPSHOT_CURSOR",
+                "snapshot cursor does not match the requested device, time window "
+                "or snapshot seq; restart the snapshot from page 1",
+            )
+        snapshot_seq = token["seq"]
+        after_shift_id = token["after_shift_id"]
+
+    get_device_or_404(db, device_id)
+
+    if cursor is None:
+        max_seq = db.execute(select(func.max(ShiftResult.seq))).scalar() or 0
+        if seq is not None:
+            if seq > max_seq:
+                raise ApiError(
+                    422,
+                    "SNAPSHOT_SEQ_OUT_OF_RANGE",
+                    f"snapshot seq {seq} is beyond the latest committed seq "
+                    f"{max_seq}; omit seq to snapshot the current maximum",
+                )
+            snapshot_seq = seq
+        else:
+            snapshot_seq = max_seq
+
+    # 每班次取 seq <= 快照序号的最后修订（revision 在同班次内随 seq 单调递增）
+    last_rev = (
+        select(
+            ShiftResult.shift_id.label("shift_id"),
+            func.max(ShiftResult.revision).label("rev_no"),
+        )
+        .where(ShiftResult.seq <= snapshot_seq)
+        .group_by(ShiftResult.shift_id)
+    ).subquery()
+    rows = db.execute(
+        select(Shift, ShiftResult)
+        .join(Shift, Shift.id == ShiftResult.shift_id)
+        .join(
+            last_rev,
+            and_(
+                ShiftResult.shift_id == last_rev.c.shift_id,
+                ShiftResult.revision == last_rev.c.rev_no,
+            ),
+        )
+        .where(
+            Shift.device_id == device_id,
+            Shift.start_ts < end_u,  # 半开区间相交
+            Shift.end_ts > start_u,
+            Shift.id > after_shift_id,  # 按键（班次 id）稳定翻页
+        )
+        .order_by(Shift.id)
+        .limit(limit + 1)
+    ).all()
+    page = [(shift, rev) for shift, rev in rows[:limit]]
+
+    next_cursor: str | None = None
+    if len(rows) > limit and page:
+        last_shift_id = page[-1][0].id
+        next_cursor = _encode_snapshot_cursor(
+            {
+                "v": _CURSOR_VERSION,
+                "device_id": device_id,
+                "start": start_iso,
+                "end": end_iso,
+                "seq": snapshot_seq,
+                "after_shift_id": last_shift_id,
+            }
+        )
+    return snapshot_seq, page, next_cursor

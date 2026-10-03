@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
@@ -34,6 +35,9 @@ from .schemas import (
     SettleResponse,
     ShiftCreate,
     ShiftOut,
+    ShiftSnapshotPage,
+    SnapshotShiftEntry,
+    parse_aware_minute_window,
 )
 
 
@@ -45,7 +49,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
@@ -54,7 +58,9 @@ app = FastAPI(
         "（全或无：逐项核对版本链，任一非法整批失败）；"
         "已结算班次支持现场人工裁定（提交/按单号撤销），裁定覆盖自动事件归因，"
         "撤销后回退；仅当各原因分钟数变化时追加班次修订并进入全局游标变更流；"
-        "GET /changes 提供按全局递增游标分页的结算/更正/裁定变更流，供下游报表同步。"
+        "GET /changes 提供按全局递增游标分页的结算/更正/裁定变更流，供下游报表同步；"
+        "GET /snapshots/shifts 按固定变更序号读取班次归因快照（首次接入/重建索引），"
+        "支持按班次标识稳定翻页。"
     ),
     lifespan=lifespan,
 )
@@ -419,5 +425,89 @@ def list_changes(
     page, next_cursor = services.list_changes(db, cursor, limit)
     return ChangePage(
         changes=[_change_entry(shift, rev) for rev, shift in page],
+        next_cursor=next_cursor,
+    )
+
+
+# ---------------------------------------------------------------- 班次归因快照
+
+
+def _snapshot_shift_entry(shift: Shift, rev: ShiftResult) -> SnapshotShiftEntry:
+    return SnapshotShiftEntry(
+        shift_id=shift.id,
+        device_id=shift.device_id,
+        shift_start=shift.start_ts,
+        shift_end=shift.end_ts,
+        revision=rev.revision,
+        seq=rev.seq,
+        totals=ReasonMinutes(
+            maintenance=rev.maintenance_minutes,
+            failure=rev.failure_minutes,
+            pending=rev.pending_minutes,
+        ),
+    )
+
+
+@app.get("/snapshots/shifts", response_model=ShiftSnapshotPage, tags=["sync"])
+def get_shift_snapshot(
+    device_id: str = Query(
+        min_length=1,
+        max_length=64,
+        description="设备标识；未知设备返回 404 DEVICE_NOT_FOUND",
+    ),
+    start: datetime = Query(
+        description="半开查询窗口起点（含）：必须带时区且精确到整分钟，如 2026-10-01T00:00:00+08:00"
+    ),
+    end: datetime = Query(
+        description="半开查询窗口终点（不含）：必须带时区且精确到整分钟"
+    ),
+    seq: int | None = Query(
+        default=None,
+        ge=0,
+        description="快照变更序号；未指定时取首次请求读取时已提交的最大变更序号",
+    ),
+    cursor: str | None = Query(
+        default=None,
+        description="上一页返回的不透明续页游标；须与设备、窗口、快照序号一致",
+    ),
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=services.SNAPSHOT_MAX_PAGE_SIZE,
+        description=f"每页条数，上限 {services.SNAPSHOT_MAX_PAGE_SIZE}",
+    ),
+    db: Session = Depends(get_db),
+):
+    """下游报表首次接入/重建索引：按固定变更序号读取班次归因快照。
+
+    - 只列与半开窗口相交、截至快照序号已结算的班次；每班次取序号不大于
+      快照序号的最后修订（班次标识、区间、修订号、三类原因分钟数），
+      按班次标识（id）升序稳定翻页；
+    - 未指定 seq 时以首次请求读取时已提交的最大变更序号为准，每页回传
+      snapshot_seq；该序号可直接作为 GET /changes 的起始游标继续增量同步；
+    - 修订只追加不修改，同一快照的后续页不受后续更正、裁定、撤销或新结算影响；
+      空快照（含 seq=0）返回空页、next_cursor=null；
+    - 序号超过当前已提交最大序号 → 422 SNAPSHOT_SEQ_OUT_OF_RANGE；
+      续页游标非法或与设备/窗口/序号不匹配 → 422 INVALID_SNAPSHOT_CURSOR；
+      缺时区、未对齐整分钟、窗口非法或页大小越界 → 422 VALIDATION_ERROR。
+    """
+    try:
+        start_ts, end_ts = parse_aware_minute_window(start, end)
+    except ValueError as exc:
+        raise services.ApiError(422, "VALIDATION_ERROR", str(exc))
+    if cursor == "":  # cursor= 视为缺省（不传游标），非法格式仍由解码层拒绝
+        cursor = None
+    snapshot_seq, page, next_cursor = services.get_shift_snapshot(
+        db,
+        device_id=device_id,
+        start=start_ts,
+        end=end_ts,
+        seq=seq,
+        cursor=cursor,
+        limit=limit,
+    )
+    return ShiftSnapshotPage(
+        snapshot_seq=snapshot_seq,
+        shifts=[_snapshot_shift_entry(shift, rev) for shift, rev in page],
         next_cursor=next_cursor,
     )
