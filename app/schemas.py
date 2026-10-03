@@ -170,6 +170,35 @@ class ChangePage(BaseModel):
     next_cursor: int
 
 
+# ---------------------------------------------------------------- 班次归因快照
+
+
+class ShiftSnapshotEntry(BaseModel):
+    """固定变更序号下班次的归因快照条目（截至该序号的最后修订，内容不可变）。"""
+
+    shift_id: int
+    start: datetime  # 班次区间起点（半开 [start, end)，UTC 输出）
+    end: datetime
+    revision: int  # 序号不大于快照序号的最后修订号
+    totals: ReasonMinutes  # 该修订的保养/故障/待判分钟数
+
+
+class ShiftSnapshotPage(BaseModel):
+    """一页班次快照。
+
+    - snapshot_seq 全部分页保持不变；每页回传，可直接作为 GET /changes 的起始游标；
+    - next_cursor 为不透明续页游标，末页为 null（null 即翻页结束）；
+    - 空快照（无任何匹配班次）首页即空页，next_cursor 为 null。
+    """
+
+    device_id: str
+    start: datetime
+    end: datetime
+    snapshot_seq: int
+    shifts: list[ShiftSnapshotEntry]
+    next_cursor: str | None
+
+
 # ---------------------------------------------------------------- 现场人工裁定
 
 

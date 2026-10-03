@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→修订/变更查询 全流程。
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→修订/变更查询→班次快照 全流程。
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -111,6 +111,39 @@ echo "-- 非法游标 / 超限页大小，预期 422 --"
 req GET "/changes?cursor=-1"
 req GET "/changes?cursor=999999"
 req GET "/changes?limit=1000"
+
+echo "-- 班次归因快照（首次接入/重建索引）：窗口 10/1-10/4，每页 1 条，首页不指定 seq 固定为当前最大序号 --"
+SNAP1="$(curl -sS "$BASE/devices/CNC-01/shift-snapshots?start=2026-10-01T00:00:00%2B08:00&end=2026-10-04T00:00:00%2B08:00&limit=1")"
+echo "$SNAP1"; echo
+SNAP_SEQ="$(echo "$SNAP1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["snapshot_seq"])')"
+SNAP_CURSOR="$(echo "$SNAP1" | python3 -c 'import sys,json,urllib.parse;c=json.load(sys.stdin)["next_cursor"];print(urllib.parse.quote(c) if c is not None else "")')"
+echo "快照序号：$SNAP_SEQ（可直接作为 /changes 的起始游标）"
+
+if [ -n "$SNAP_CURSOR" ]; then
+  echo "-- 快照续页：原样回传不透明游标，末页 next_cursor 应为 null --"
+  req GET "/devices/CNC-01/shift-snapshots?start=2026-10-01T00:00:00%2B08:00&end=2026-10-04T00:00:00%2B08:00&limit=1&cursor=$SNAP_CURSOR"
+else
+  echo "-- 本窗口仅一个班次：首页即末页，next_cursor=null（无续页）--"
+  # 再造一个已结算班次以演示续页游标
+  req POST /shifts '{"device_id":"CNC-01","start":"2026-10-02T08:00:00+08:00","end":"2026-10-02T16:00:00+08:00"}'
+  req POST /shifts/2/settle
+  SNAP1="$(curl -sS "$BASE/devices/CNC-01/shift-snapshots?start=2026-10-01T00:00:00%2B08:00&end=2026-10-04T00:00:00%2B08:00&limit=1")"
+  SNAP_CURSOR="$(echo "$SNAP1" | python3 -c 'import sys,json,urllib.parse;print(urllib.parse.quote(json.load(sys.stdin)["next_cursor"]))')"
+  echo "-- 快照续页：原样回传不透明游标，第二页 next_cursor 应为 null --"
+  req GET "/devices/CNC-01/shift-snapshots?start=2026-10-01T00:00:00%2B08:00&end=2026-10-04T00:00:00%2B08:00&limit=1&cursor=$SNAP_CURSOR"
+fi
+
+echo "-- 固定 seq=1 重建索引：只含当时已结算班次的截至修订（历史不可变）--"
+req GET "/devices/CNC-01/shift-snapshots?start=2026-10-01T00:00:00%2B08:00&end=2026-10-04T00:00:00%2B08:00&seq=1"
+
+echo "-- 快照序号衔接变更流：cursor=$SNAP_SEQ（有新变更则列出，否则空页保持游标）--"
+req GET "/changes?cursor=$SNAP_SEQ"
+
+echo "-- 快照非法参数：序号超范围 422 INVALID_SNAPSHOT_SEQ / 游标不匹配 422 INVALID_CURSOR / 缺时区 422 / 未知设备 404 --"
+req GET "/devices/CNC-01/shift-snapshots?start=2026-10-01T00:00:00%2B08:00&end=2026-10-04T00:00:00%2B08:00&seq=999999"
+req GET "/devices/CNC-01/shift-snapshots?start=2026-10-02T00:00:00%2B08:00&end=2026-10-04T00:00:00%2B08:00&seq=1&cursor=$SNAP_CURSOR"
+req GET "/devices/CNC-01/shift-snapshots?start=2026-10-01T00:00:00&end=2026-10-04T00:00:00%2B08:00"
+req GET "/devices/NOPE/shift-snapshots?start=2026-10-01T00:00:00%2B08:00&end=2026-10-04T00:00:00%2B08:00"
 
 echo "-- 非法区间 / 未知设备，预期 422 / 404 --"
 req POST /shifts '{"device_id":"CNC-01","start":"2026-10-02T16:00:00+08:00","end":"2026-10-02T08:00:00+08:00"}'

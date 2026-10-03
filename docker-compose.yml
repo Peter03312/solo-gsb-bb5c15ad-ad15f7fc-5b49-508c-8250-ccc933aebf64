@@ -19,6 +19,8 @@ services:
     build: .
     environment:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/downtime
+      # 快照续页游标的 HMAC 签名密钥；多实例/生产部署应改为固定的随机值
+      CURSOR_SECRET: change-me-to-a-random-secret
     ports:
       - "8000:8000"
     depends_on:

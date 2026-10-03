@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
+import json
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
@@ -13,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from . import attribution
 from .attribution import EventView, RulingView
+from .config import settings
 from .models import (
     ChangeCounter,
     Device,
@@ -803,3 +807,177 @@ def list_changes(
     page = [(rev, shift) for rev, shift in rows]
     next_cursor = page[-1][0].seq if page else cursor
     return page, next_cursor
+
+
+# ---------------------------------------------------------------- 班次归因快照
+
+#: GET /devices/{id}/shift-snapshots 允许的页大小上限
+MAX_SNAPSHOT_PAGE_SIZE = 500
+
+
+def _current_max_seq(db: Session) -> int:
+    """当前已提交的最大变更序号（无任何变更时为 0）。"""
+    return db.execute(select(func.max(ShiftResult.seq))).scalar() or 0
+
+
+def _snapshot_cursor_mac(payload: bytes) -> bytes:
+    return hmac.new(settings.cursor_secret.encode(), payload, hashlib.sha256).digest()
+
+
+def encode_snapshot_cursor(
+    device_id: str,
+    start: datetime,
+    end: datetime,
+    snapshot_seq: int,
+    after_shift_id: int,
+) -> str:
+    """把续页状态编码为不透明游标（base64url(JSON) + HMAC-SHA256 签名）。"""
+    body = {
+        "device_id": device_id,
+        "start": start.astimezone(timezone.utc).isoformat(),
+        "end": end.astimezone(timezone.utc).isoformat(),
+        "seq": snapshot_seq,
+        "after": after_shift_id,
+    }
+    payload = json.dumps(body, separators=(",", ":"), sort_keys=True).encode()
+    mac = _snapshot_cursor_mac(payload)
+    return (
+        base64.urlsafe_b64encode(payload).rstrip(b"=")
+        + b"."
+        + base64.urlsafe_b64encode(mac).rstrip(b"=")
+    ).decode()
+
+
+def decode_snapshot_cursor(token: str) -> dict:
+    """解码并验签续页游标；任何伪造/篡改/损坏一律视为非法游标。"""
+    invalid = ApiError(
+        422,
+        "INVALID_CURSOR",
+        "continuation cursor is invalid, malformed or tampered with; "
+        "restart the snapshot from its first page without a cursor",
+    )
+    parts = token.split(".")
+    if len(parts) != 2:
+        raise invalid
+
+    def _b64(seg: str) -> bytes:
+        return seg.encode() + b"=" * (-len(seg) % 4)
+
+    try:
+        payload = base64.urlsafe_b64decode(_b64(parts[0]))
+        mac = base64.urlsafe_b64decode(_b64(parts[1]))
+        body = json.loads(payload)
+    except (ValueError, json.JSONDecodeError):
+        raise invalid
+    if not hmac.compare_digest(mac, _snapshot_cursor_mac(payload)):
+        raise invalid
+    try:
+        start = datetime.fromisoformat(body["start"])
+        end = datetime.fromisoformat(body["end"])
+        seq = int(body["seq"])
+        after = int(body["after"])
+        device_id = str(body["device_id"])
+    except (KeyError, TypeError, ValueError):
+        raise invalid
+    if start.tzinfo is None or end.tzinfo is None or seq < 0 or after < 0:
+        raise invalid
+    return {"device_id": device_id, "start": start, "end": end, "seq": seq, "after": after}
+
+
+def get_shift_snapshot(
+    db: Session,
+    device_id: str,
+    start: datetime,
+    end: datetime,
+    snapshot_seq: int | None,
+    limit: int,
+    cursor: str | None,
+) -> tuple[list[tuple[Shift, ShiftResult]], int, str | None]:
+    """按固定变更序号读取与窗口相交、截至该序号已结算班次的快照页。
+
+    - 每班次只取 seq <= snapshot_seq 的最后修订（历史修订不可变）；
+    - 按班次 id（即班次标识）稳定升序翻页，游标携带本页最后一个班次 id；
+    - 返回 (页内 [(班次, 修订)], 快照序号, 续页游标或 None)。
+    """
+    get_device_or_404(db, device_id)
+    win_start, win_end = _utc(start), _utc(end)
+    max_committed_seq = _current_max_seq(db)
+
+    if cursor is not None:
+        state = decode_snapshot_cursor(cursor)
+        # 游标必须与本次筛选条件及快照序号严格匹配，否则明确报错
+        if state["device_id"] != device_id:
+            raise ApiError(
+                422,
+                "INVALID_CURSOR",
+                "continuation cursor belongs to a different device",
+            )
+        if state["start"] != win_start or state["end"] != win_end:
+            raise ApiError(
+                422,
+                "INVALID_CURSOR",
+                "continuation cursor does not match the requested time window; "
+                "restart the snapshot with the original window",
+            )
+        if snapshot_seq is not None and state["seq"] != snapshot_seq:
+            raise ApiError(
+                422,
+                "INVALID_CURSOR",
+                "continuation cursor does not match the requested snapshot seq",
+            )
+        # 游标在首页签发时已校验过序号；历史序号永不失效，续页不再校验上界
+        snapshot_seq = state["seq"]
+        after_shift_id = state["after"]
+    else:
+        # 未指定快照序号：以本次请求读取时已提交的最大变更序号为准
+        if snapshot_seq is None:
+            snapshot_seq = max_committed_seq
+        elif snapshot_seq > max_committed_seq:
+            raise ApiError(
+                422,
+                "INVALID_SNAPSHOT_SEQ",
+                f"snapshot seq {snapshot_seq} is beyond the latest committed "
+                f"seq {max_committed_seq}; specify a seq no greater than the "
+                "current maximum (0 is a valid empty snapshot)",
+            )
+        after_shift_id = 0
+
+    # 每班次截至 snapshot_seq 的最后修订：窗口相交按半开区间判定（端点相接不相交）。
+    # 快照只读不可变数据（shift_results/shift 已提交行不再改写），
+    # 且按 shift 主键键集翻页 —— 后续更正/裁定/新结算只追加更大 seq 的修订，
+    # 不会出现在 seq <= snapshot_seq 的结果中，同一快照后续页因此保持不变。
+    last_rev_subq = (
+        select(
+            ShiftResult.shift_id.label("shift_id"),
+            func.max(ShiftResult.revision).label("max_revision"),
+        )
+        .where(ShiftResult.seq <= snapshot_seq)
+        .group_by(ShiftResult.shift_id)
+        .subquery()
+    )
+    rows = db.execute(
+        select(Shift, ShiftResult)
+        .join(ShiftResult, ShiftResult.shift_id == Shift.id)
+        .join(
+            last_rev_subq,
+            and_(
+                last_rev_subq.c.shift_id == ShiftResult.shift_id,
+                last_rev_subq.c.max_revision == ShiftResult.revision,
+            ),
+        )
+        .where(
+            Shift.device_id == device_id,
+            Shift.start_ts < win_end,
+            Shift.end_ts > win_start,
+            Shift.id > after_shift_id,
+        )
+        .order_by(Shift.id)
+        .limit(limit + 1)
+    ).all()
+    page = [(shift, rev) for shift, rev in rows[:limit]]
+    next_cursor = None
+    if len(rows) > limit:
+        next_cursor = encode_snapshot_cursor(
+            device_id, win_start, win_end, snapshot_seq, page[-1][0].id
+        )
+    return page, snapshot_seq, next_cursor
